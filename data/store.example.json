@@ -1,0 +1,52 @@
+{
+  "config": {
+    "eventTitle": "微信签到抽奖活动",
+    "subtitle": "扫码签到 · 头像滚动 · 幸运抽奖",
+    "adminPassword": "admin123",
+    "screenPassword": "screen123",
+    "logoUrl": "",
+    "musicUrl": "",
+    "theme": "celebration",
+    "wallMode": "orbit",
+    "wallText": "LUCKY",
+    "allowRepeatWinners": false,
+    "companies": [
+      "总部",
+      "市场部",
+      "销售部",
+      "技术部",
+      "合作伙伴"
+    ],
+    "logoPosition": {
+      "x": 32,
+      "y": 24
+    },
+    "qrPosition": {
+      "x": 1120,
+      "y": 28
+    },
+    "qrSize": 106
+  },
+  "attendees": [],
+  "prizes": [
+    {
+      "id": "grand-prize",
+      "name": "一等奖",
+      "quantity": 1,
+      "drawCount": 1,
+      "imageUrl": "",
+      "animation": "orbit",
+      "fixedWinnerIds": []
+    },
+    {
+      "id": "second-prize",
+      "name": "二等奖",
+      "quantity": 3,
+      "drawCount": 1,
+      "imageUrl": "",
+      "animation": "wall",
+      "fixedWinnerIds": []
+    }
+  ],
+  "winners": []
+}
