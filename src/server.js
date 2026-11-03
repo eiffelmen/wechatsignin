@@ -35,6 +35,10 @@ const io = new Server(server);
 app.use(express.json({ limit: '8mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(UPLOAD_DIR));
+app.get('/vendor/lucide.js', (req, res) => {
+  res.sendFile(path.join(ROOT_DIR, 'node_modules', 'lucide', 'dist', 'umd', 'lucide.min.js'));
+});
+app.use('/vendor/three', express.static(path.join(ROOT_DIR, 'node_modules', 'three', 'build')));
 app.use(express.static(PUBLIC_DIR));
 
 const upload = multer({
@@ -48,6 +52,20 @@ const upload = multer({
   }),
   limits: { fileSize: 30 * 1024 * 1024 }
 });
+
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024, files: 1 }
+});
+
+function avatarExtension(buffer) {
+  if (buffer.length < 12) return null;
+  if (buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return '.png';
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return '.jpg';
+  if (['GIF87a', 'GIF89a'].includes(buffer.toString('ascii', 0, 6))) return '.gif';
+  if (buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') return '.webp';
+  return null;
+}
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -179,6 +197,15 @@ function escapeXml(value) {
 
 function avatarDataUri(name, color) {
   const label = escapeXml((name || '嘉宾').slice(-2));
+  if (!color) {
+    const colors = ['#b91c1c', '#0f766e', '#1d4ed8', '#a16207', '#be185d', '#6d28d9'];
+    let hash = 0;
+    const text = String(name || '嘉宾').trim().slice(-2);
+    for (let index = 0; index < text.length; index += 1) hash = ((hash << 5) - hash + text.charCodeAt(index)) | 0;
+    color = colors[Math.abs(hash) % colors.length];
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="160" height="160" rx="80" fill="${color}"/><circle cx="118" cy="30" r="46" fill="#f4c762" opacity=".65"/><text x="80" y="96" text-anchor="middle" font-size="48" fill="#fff" font-family="Arial, sans-serif" font-weight="700">${label}</text></svg>`;
+    return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+  }
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="${color}"/><stop offset="1" stop-color="#f8d56b"/></linearGradient></defs><rect width="160" height="160" rx="80" fill="url(#g)"/><text x="80" y="94" text-anchor="middle" font-size="48" fill="#fff" font-family="Arial, sans-serif" font-weight="700">${label}</text></svg>`;
   return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
 }
@@ -301,7 +328,7 @@ app.post('/api/login', (req, res) => {
     res.status(401).json({ message: '密码不正确' });
     return;
   }
-  res.json({ ok: true, role, path: role === 'admin' ? '/admin' : '/screen' });
+  res.json({ ok: true, role, path: role === 'admin' ? '/admin' : '/screen/checkin' });
 });
 
 app.get('/api/qrcode.svg', async (req, res, next) => {
@@ -372,7 +399,7 @@ app.get('/wechat/oauth/callback', async (req, res, next) => {
 
 app.get('/checkin', (req, res, next) => {
   const config = getWechatOAuthConfig(req);
-  if (!req.query.checked && config.ready && (isWechatBrowser(req) || req.query.oauth === '1')) {
+  if (loadStore().config.checkinMode === 'wechat' && !req.query.checked && config.ready && (isWechatBrowser(req) || req.query.oauth === '1')) {
     res.redirect('/wechat/oauth/start');
     return;
   }
@@ -388,6 +415,7 @@ app.put('/api/config', (req, res) => {
   if ('logoUrl' in body) next.logoUrl = cleanText(body.logoUrl, 500);
   if ('musicUrl' in body) next.musicUrl = cleanText(body.musicUrl, 500);
   if ('theme' in body) next.theme = cleanText(body.theme, 40) || 'celebration';
+  if (['local', 'wechat'].includes(body.checkinMode)) next.checkinMode = body.checkinMode;
   if ('wallMode' in body) next.wallMode = ['orbit', 'sphere', 'wall', 'text'].includes(body.wallMode) ? body.wallMode : next.wallMode;
   if ('wallText' in body) next.wallText = cleanText(body.wallText, 16) || 'LUCKY';
   if ('allowRepeatWinners' in body) next.allowRepeatWinners = Boolean(body.allowRepeatWinners);
@@ -417,28 +445,59 @@ app.post('/api/upload/:kind', upload.single('file'), (req, res) => {
   });
 });
 
+app.post('/api/checkin/avatar', (req, res, next) => {
+  avatarUpload.single('file')(req, res, (error) => {
+    if (error) {
+      res.status(400).json({ message: error.code === 'LIMIT_FILE_SIZE' ? '头像不能超过 2 MB' : '头像上传失败，请重新选择图片' });
+      return;
+    }
+    const extension = req.file && avatarExtension(req.file.buffer);
+    if (!extension) {
+      res.status(400).json({ message: '请选择 JPG、PNG、WebP 或 GIF 图片' });
+      return;
+    }
+    try {
+      const filename = `avatar-${crypto.randomUUID()}${extension}`;
+      fs.writeFileSync(path.join(UPLOAD_DIR, filename), req.file.buffer);
+      res.json({ url: `/uploads/${filename}` });
+    } catch (writeError) {
+      next(writeError);
+    }
+  });
+});
+
 app.post('/api/checkin', (req, res) => {
   const store = loadStore();
   const now = new Date().toISOString();
   const body = req.body || {};
   const openid = cleanText(body.openid, 160) || cleanText(body.visitorId, 160) || `local-${crypto.randomUUID()}`;
   const phone = cleanPhone(body.phone);
-  const attendee = {
-    id: crypto.randomUUID(),
-    openid,
-    nickname: cleanText(body.nickname, 60) || '微信用户',
-    avatar: cleanText(body.avatar, 5000),
-    name: cleanText(body.name, 40),
-    company: cleanText(body.company, 80),
-    phone,
-    source: cleanText(body.source, 30) || 'wechat-scan',
-    checkedInAt: now
-  };
-  if (!attendee.name || !attendee.phone) {
-    res.status(400).json({ message: '姓名和手机号必填' });
+  const name = cleanText(body.name, 40);
+  if (!name) {
+    res.status(400).json({ message: '请填写姓名' });
     return;
   }
   const existing = store.attendees.find((item) => item.openid === openid || (phone && item.phone === phone));
+  const source = cleanText(body.source, 30) || 'local-form';
+  let avatar = cleanText(body.avatar, 5000);
+  if (source === 'local-form' && avatar) {
+    if (!/^\/uploads\/avatar-[a-f0-9-]+\.(jpg|png|webp|gif)$/.test(avatar) || !fs.existsSync(path.join(UPLOAD_DIR, path.basename(avatar)))) {
+      res.status(400).json({ message: '头像文件无效，请重新上传' });
+      return;
+    }
+  }
+  if (!avatar) avatar = avatarDataUri(name);
+  const attendee = {
+    id: crypto.randomUUID(),
+    openid,
+    nickname: cleanText(body.nickname, 60) || name,
+    avatar,
+    name,
+    company: body.company === undefined ? existing?.company || '' : cleanText(body.company, 80),
+    phone: body.phone === undefined ? existing?.phone || '' : phone,
+    source,
+    checkedInAt: now
+  };
   let saved;
   if (existing) {
     Object.assign(existing, attendee, { id: existing.id, checkedInAt: existing.checkedInAt, updatedAt: now });
@@ -449,7 +508,7 @@ app.post('/api/checkin', (req, res) => {
   }
   saveStore(store);
   emitState(req, 'checkin:new', saved);
-  res.json({ ok: true, attendee: saved });
+  res.json({ ok: true, attendee: saved, existing: Boolean(existing) });
 });
 
 app.get('/api/attendees', (req, res) => {

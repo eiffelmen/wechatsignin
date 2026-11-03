@@ -15,7 +15,7 @@ test('initial store has required sections', () => {
 });
 
 test('browser entry files exist', () => {
-  for (const file of ['index.html', 'styles.css', 'app.js']) {
+  for (const file of ['index.html', 'styles.css', 'app.js', 'lottery-scene.js']) {
     assert.ok(fs.existsSync(path.join(root, 'src', 'public', file)));
   }
 });

@@ -11,11 +11,27 @@ let state = {
 let socket;
 let activeAdminTab = 'checkins';
 let selectedLoginRole = 'admin';
+const checkinUiState = {
+  visitorId: '',
+  initialized: false,
+  editing: false,
+  name: '',
+  avatar: '',
+  preview: '',
+  file: null,
+  preparing: false,
+  submitting: false
+};
 let screenUiState = {
   selectedPrizeId: null
 };
 let drawState = {
   rolling: false,
+  stopping: false,
+  scene: null,
+  runId: 0,
+  prizeId: null,
+  count: 1,
   timer: null,
   fxTimer: null,
   candidates: [],
@@ -28,6 +44,10 @@ let dragState = {
 
 document.addEventListener('DOMContentLoaded', boot);
 window.addEventListener('popstate', render);
+window.addEventListener('resize', () => {
+  if (drawState.rolling) refreshDrawGeometry(drawState.activeAnimation);
+  else if (window.location.pathname === '/screen/checkin') paintAvatarStage();
+});
 
 async function boot() {
   await refreshState();
@@ -44,6 +64,9 @@ function connectSocket() {
   socket = io();
   socket.on('state', (nextState) => {
     state = nextState;
+    const keepCheckinDraft = window.location.pathname === '/checkin'
+      && state.config.checkinMode !== 'wechat' && document.querySelector('#localCheckinForm');
+    if (keepCheckinDraft) return;
     if (!drawState.rolling && !dragState.active) render();
   });
   socket.on('checkin:new', showFlyCard);
@@ -51,16 +74,20 @@ function connectSocket() {
 
 function render() {
   const path = window.location.pathname;
+  if (path !== '/screen/checkin') {
+    document.querySelectorAll('.fly-card').forEach((card) => card.remove());
+  }
   if (path === '/checkin') {
     renderCheckin();
     return;
   }
-  if (path === '/screen') {
+  if (['/screen', '/screen/checkin', '/screen/lottery'].includes(path)) {
     if (!hasRole('screen')) {
       renderLogin('screen');
       return;
     }
-    renderScreen();
+    if (path === '/screen/checkin') renderCheckinScreen();
+    else renderScreen();
     return;
   }
   if (path === '/admin') {
@@ -167,7 +194,9 @@ function renderLogin(forceRole = selectedLoginRole) {
         body: { role: selectedLoginRole, password: document.querySelector('#loginPassword').value }
       });
       sessionStorage.setItem('lotteryRole', result.role);
-      navigate(result.path);
+      const screenPath = ['/screen', '/screen/checkin', '/screen/lottery'].includes(location.pathname)
+        ? location.pathname : '/screen/checkin';
+      navigate(result.role === 'screen' ? screenPath : result.path);
     } catch (err) {
       error.textContent = err.message;
     }
@@ -175,6 +204,10 @@ function renderLogin(forceRole = selectedLoginRole) {
 }
 
 function renderCheckin() {
+  if (state.config.checkinMode !== 'wechat') {
+    renderLocalCheckin();
+    return;
+  }
   const params = new URLSearchParams(window.location.search);
   const isWechat = /MicroMessenger/i.test(navigator.userAgent);
   const attendee = state.attendees.find((item) => item.id === params.get('attendee'));
@@ -218,28 +251,214 @@ function renderCheckin() {
   `;
 }
 
-function renderCheckinSuccess(attendee) {
+function renderLocalCheckin() {
+  const visitorId = getVisitorId();
+  const attendee = state.attendees.find((item) => item.openid === visitorId);
+  if (attendee && !checkinUiState.editing) {
+    renderCheckinSuccess(attendee, true);
+    return;
+  }
+  if (!checkinUiState.initialized) {
+    checkinUiState.name = attendee?.name || '';
+    checkinUiState.avatar = attendee?.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
+    checkinUiState.initialized = true;
+  }
+  const preview = checkinUiState.preview || checkinUiState.avatar || makeAvatarDataUrl(checkinUiState.name);
   app.innerHTML = `
-    <main class="checkin-page">
-      <section class="checkin-card success-state">
+    <main class="checkin-page local-checkin-page">
+      <section class="checkin-card local-checkin-card">
+        <header class="local-checkin-heading">
+          <span>来宾签到</span>
+          <h1>${escapeHtml(state.config.eventTitle || '欢迎来到活动现场')}</h1>
+        </header>
+        <form id="localCheckinForm" class="checkin-form">
+          <div class="checkin-avatar-field">
+            <div class="checkin-avatar-preview">
+              <img id="checkinAvatarPreview" src="${escapeHtml(preview)}" alt="签到头像预览" />
+              <button id="chooseCheckinAvatar" type="button" aria-label="选择头像" title="选择头像">${screenIcon('camera')}</button>
+            </div>
+            <input id="checkinAvatarFile" class="checkin-file-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif" aria-label="上传头像" tabindex="-1" />
+            <span class="checkin-avatar-label">头像（选填）</span>
+            <button id="useNameAvatar" class="checkin-text-button" type="button" ${checkinUiState.preview || checkinUiState.avatar ? '' : 'hidden'}>使用姓名头像</button>
+          </div>
+          <label for="checkinName">姓名
+            <input id="checkinName" name="name" autocomplete="name" maxlength="40" required value="${escapeHtml(checkinUiState.name)}" placeholder="请输入姓名" />
+          </label>
+          <div id="checkinError" class="error-text" role="alert" aria-live="polite"></div>
+          <button id="submitCheckin" type="submit">${screenIcon('check')}<span>${attendee ? '保存资料' : '确认签到'}</span></button>
+        </form>
+      </section>
+    </main>`;
+  bindLocalCheckinForm();
+  window.lucide?.createIcons();
+}
+
+function updateCheckinAvatarPreview() {
+  const preview = document.querySelector('#checkinAvatarPreview');
+  if (preview) preview.src = checkinUiState.preview || checkinUiState.avatar || makeAvatarDataUrl(checkinUiState.name);
+  const reset = document.querySelector('#useNameAvatar');
+  if (reset) reset.hidden = !checkinUiState.preview && !checkinUiState.avatar;
+}
+
+function updateCheckinBusy() {
+  const busy = checkinUiState.preparing || checkinUiState.submitting;
+  for (const selector of ['#submitCheckin', '#chooseCheckinAvatar', '#checkinAvatarFile', '#useNameAvatar']) {
+    const element = document.querySelector(selector);
+    if (element) element.disabled = busy;
+  }
+  const name = document.querySelector('#checkinName');
+  if (name) name.disabled = checkinUiState.submitting;
+  const button = document.querySelector('#submitCheckin span');
+  if (button) button.textContent = checkinUiState.submitting ? '正在提交' : checkinUiState.preparing ? '正在处理头像' : checkinUiState.editing ? '保存资料' : '确认签到';
+  document.querySelector('#localCheckinForm')?.setAttribute('aria-busy', String(busy));
+}
+
+function clearCheckinPreview() {
+  if (checkinUiState.preview) URL.revokeObjectURL(checkinUiState.preview);
+  checkinUiState.preview = '';
+}
+
+async function prepareCheckinAvatar(file) {
+  if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.type)) {
+    throw new Error('请选择 JPG、PNG、WebP 或 GIF 图片');
+  }
+  if (file.size > 12 * 1024 * 1024) throw new Error('照片不能超过 12 MB');
+  const url = URL.createObjectURL(file);
+  try {
+    const image = await new Promise((resolve, reject) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => reject(new Error('无法读取这张照片，请重新选择'));
+      element.src = url;
+    });
+    const side = Math.min(image.naturalWidth, image.naturalHeight);
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = Math.min(512, side);
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(image, (image.naturalWidth - side) / 2, (image.naturalHeight - side) / 2, side, side, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+    if (!blob) throw new Error('照片处理失败，请重新选择');
+    return new File([blob], 'avatar.jpg', { type: 'image/jpeg' });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function bindLocalCheckinForm() {
+  const fileInput = document.querySelector('#checkinAvatarFile');
+  document.querySelector('#chooseCheckinAvatar').addEventListener('click', () => fileInput.click());
+  document.querySelector('#checkinName').addEventListener('input', (event) => {
+    checkinUiState.name = event.target.value;
+    document.querySelector('#checkinError').textContent = '';
+    updateCheckinAvatarPreview();
+  });
+  document.querySelector('#useNameAvatar').addEventListener('click', () => {
+    clearCheckinPreview();
+    checkinUiState.avatar = '';
+    checkinUiState.file = null;
+    fileInput.value = '';
+    document.querySelector('#checkinError').textContent = '';
+    updateCheckinAvatarPreview();
+  });
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    checkinUiState.preparing = true;
+    updateCheckinBusy();
+    const error = document.querySelector('#checkinError');
+    error.textContent = '';
+    try {
+      const prepared = await prepareCheckinAvatar(file);
+      clearCheckinPreview();
+      checkinUiState.file = prepared;
+      checkinUiState.avatar = '';
+      checkinUiState.preview = URL.createObjectURL(prepared);
+      updateCheckinAvatarPreview();
+    } catch (err) {
+      error.textContent = err.message;
+    } finally {
+      checkinUiState.preparing = false;
+      fileInput.value = '';
+      updateCheckinBusy();
+    }
+  });
+  document.querySelector('#localCheckinForm').addEventListener('submit', submitLocalCheckin);
+}
+
+async function submitLocalCheckin(event) {
+  event.preventDefault();
+  if (checkinUiState.submitting || checkinUiState.preparing) return;
+  const name = checkinUiState.name.replace(/\s+/g, ' ').trim();
+  const error = document.querySelector('#checkinError');
+  error.textContent = '';
+  if (!name) {
+    error.textContent = '请填写姓名';
+    document.querySelector('#checkinName').focus();
+    return;
+  }
+  checkinUiState.submitting = true;
+  updateCheckinBusy();
+  try {
+    if (checkinUiState.file) {
+      const data = new FormData();
+      data.append('file', checkinUiState.file);
+      const uploaded = await api('/api/checkin/avatar', { method: 'POST', body: data });
+      checkinUiState.avatar = uploaded.url;
+      checkinUiState.file = null;
+    }
+    const result = await api('/api/checkin', {
+      method: 'POST',
+      body: { visitorId: getVisitorId(), name, avatar: checkinUiState.avatar, source: 'local-form' }
+    });
+    const index = state.attendees.findIndex((item) => item.id === result.attendee.id);
+    if (index < 0) state.attendees.push(result.attendee);
+    else state.attendees[index] = result.attendee;
+    checkinUiState.editing = false;
+    clearCheckinPreview();
+    renderLocalCheckin();
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    checkinUiState.submitting = false;
+    updateCheckinBusy();
+  }
+}
+
+function renderCheckinSuccess(attendee, local = false) {
+  app.innerHTML = `
+    <main class="checkin-page ${local ? 'local-checkin-page' : ''}">
+      <section class="checkin-card success-state ${local ? 'local-checkin-card' : ''}">
         <img class="rolling-avatar" src="${escapeHtml(attendee.avatar || makeAvatarDataUrl(attendee.name))}" alt="" />
         <h1 class="mobile-title">签到成功</h1>
-        <p class="mobile-copy">${escapeHtml(attendee.name)}，祝你好运</p>
+        <p class="mobile-copy checkin-success-name">${escapeHtml(attendee.name)}，祝你好运</p>
+        ${local ? '<button id="editCheckin" class="checkin-text-button" type="button">修改资料</button>' : ''}
       </section>
     </main>
   `;
+  if (local) {
+    document.querySelector('#editCheckin').addEventListener('click', () => {
+      checkinUiState.initialized = true;
+      checkinUiState.editing = true;
+      checkinUiState.name = attendee.name;
+      checkinUiState.avatar = attendee.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
+      renderLocalCheckin();
+    });
+  }
 }
 
 function getVisitorId(openid) {
-  if (openid) {
-    localStorage.setItem('wechatLotteryVisitorId', openid);
-    return openid;
-  }
-  let visitorId = localStorage.getItem('wechatLotteryVisitorId');
-  if (!visitorId) {
-    visitorId = `visitor-${cryptoRandom()}`;
+  if (!openid && checkinUiState.visitorId) return checkinUiState.visitorId;
+  let visitorId = openid;
+  try {
+    visitorId ||= localStorage.getItem('wechatLotteryVisitorId');
+  } catch { /* Private webviews may disable storage. */ }
+  visitorId ||= `visitor-${cryptoRandom()}`;
+  checkinUiState.visitorId = visitorId;
+  try {
     localStorage.setItem('wechatLotteryVisitorId', visitorId);
-  }
+  } catch { /* Keep a stable identity for this page session. */ }
   return visitorId;
 }
 
@@ -265,29 +484,47 @@ function hashCode(value) {
   return hash;
 }
 
-function renderScreen() {
+function screenIcon(name) {
+  return `<i data-lucide="${name}" aria-hidden="true"></i>`;
+}
+
+function renderScreenBrand() {
+  const config = state.config || {};
+  const x = clampScreenPosition(config.logoPosition?.x, 32, 190, 'x');
+  const y = clampScreenPosition(config.logoPosition?.y, 24, 82, 'y');
+  return `<div class="draggable screen-logo" data-drag-key="logoPosition" aria-label="可拖动活动 Logo" title="按住拖动 Logo" style="left:${x}px; top:${y}px;">
+    ${config.logoUrl ? `<img src="${escapeHtml(config.logoUrl)}" alt="活动 Logo" />` : '<div class="brand-mark">签</div><strong>活动现场</strong>'}
+  </div>`;
+}
+
+function renderScreenToolbar(mode) {
+  return `<footer class="screen-toolbar">
+    <nav class="screen-page-switch" aria-label="大屏页面">
+      <a href="/screen/checkin" data-screen-path="/screen/checkin" ${mode === 'checkin' ? 'aria-current="page"' : ''}>${screenIcon('scan-line')}签到展示</a>
+      <a href="/screen/lottery" data-screen-path="/screen/lottery" ${mode === 'lottery' ? 'aria-current="page"' : ''}>${screenIcon('gift')}幸运抽奖</a>
+    </nav>
+    <div class="screen-tools">
+      ${mode === 'checkin' ? `<button class="ghost icon-button" id="shapeButton" aria-label="切换头像墙" title="切换头像墙">${screenIcon('layout-grid')}</button>` : ''}
+      <button class="ghost icon-button" id="fullscreenButton" aria-label="全屏" title="全屏">${screenIcon('maximize')}</button>
+      <button class="ghost icon-button" id="musicButton" aria-label="音乐" title="音乐" ${state.config.musicUrl ? '' : 'disabled'}>${screenIcon('music-2')}</button>
+      <button class="ghost icon-button" id="backAdminButton" aria-label="后台" title="后台">${screenIcon('settings')}</button>
+    </div>
+  </footer>`;
+}
+
+function renderCheckinScreen() {
+  disposeDrawScene();
   const config = state.config || {};
   const qrSize = clampQrSize(config.qrSize || 106);
-  const logoX = clampScreenPosition(config.logoPosition?.x, 32, 190, 'x');
-  const logoY = clampScreenPosition(config.logoPosition?.y, 24, 82, 'y');
   const qrX = clampScreenPosition(config.qrPosition?.x, Math.max(window.innerWidth - qrSize - 16, 36), qrSize + 10, 'x');
   const qrY = clampScreenPosition(config.qrPosition?.y, 28, qrSize + 46, 'y');
-  const selectedPrize = getSelectedScreenPrize();
-  const selectedWinners = selectedPrize ? state.winners.filter((winner) => winner.prizeId === selectedPrize.id) : [];
-  const selectedQuantity = Math.max(0, Number(selectedPrize?.quantity || 0));
-  const selectedRemaining = Math.max(0, selectedQuantity - selectedWinners.length);
-  const selectedDrawCount = Math.max(1, Math.min(Number(selectedPrize?.drawCount || 1), selectedRemaining || 1));
-  const prizeOptions = state.prizes.map((prize) => `<option value="${escapeHtml(prize.id)}" ${prize.id === selectedPrize?.id ? 'selected' : ''}>${escapeHtml(prize.name)}</option>`).join('');
+  const recent = state.attendees.slice(-6).reverse();
   app.innerHTML = `
-    <main class="screen-page">
-      <div class="screen-tech-lines" aria-hidden="true"><i></i><i></i><i></i></div>
-      <div class="draggable screen-logo" data-drag-key="logoPosition" aria-label="可拖动活动 Logo" title="按住拖动 Logo" style="left:${logoX}px; top:${logoY}px;">
-        ${config.logoUrl ? `<img src="${escapeHtml(config.logoUrl)}" alt="logo" />` : '<div class="brand-mark">签</div><strong>活动现场</strong>'}
-      </div>
+    <main class="screen-page checkin-display-page">
+      ${renderScreenBrand()}
       <div class="draggable qr-card" data-drag-key="qrPosition" aria-label="可拖动签到二维码" title="按住拖动二维码，拖右下角可缩放" style="right:auto; left:${qrX}px; top:${qrY}px; --qr-size:${qrSize}px;">
         <img draggable="false" src="/api/qrcode.svg?target=${encodeURIComponent(state.checkinUrl || `${location.origin}/checkin`)}" alt="签到二维码" />
         <strong>微信扫码签到</strong>
-        <span>拖动摆放</span>
         <button class="qr-resize-handle" type="button" aria-label="拖动缩放二维码" title="拖动缩放"></button>
         <div class="qr-size-controls" aria-label="二维码大小调整">
           <button class="qr-size-step" type="button" data-qr-size-delta="-24" aria-label="缩小二维码">-</button>
@@ -295,10 +532,53 @@ function renderScreen() {
         </div>
       </div>
       ${config.musicUrl ? `<audio id="screenAudio" src="${escapeHtml(config.musicUrl)}" loop></audio>` : ''}
+      <div class="screen-content checkin-display-content">
+        <header class="screen-title checkin-display-title">
+          <span class="screen-section-label">现场签到</span>
+          <h1>${escapeHtml(config.eventTitle || '微信签到抽奖活动')}</h1>
+          <div class="checkin-total" aria-live="polite">已签到 <strong>${state.attendees.length}</strong> 位</div>
+        </header>
+        <section class="checkin-display-wall" aria-label="签到头像墙">
+          <div id="avatarStage" class="avatar-stage ${escapeHtml(config.wallMode || 'sphere')}"></div>
+        </section>
+        <section class="recent-checkins" aria-label="最近签到">
+          <h2>最近签到</h2>
+          <div class="recent-checkin-list">${recent.length ? recent.map((attendee) => `
+            <div class="recent-checkin-item">
+              <img src="${escapeHtml(attendee.avatar || makeAvatarDataUrl(attendee.name))}" alt="" />
+              <strong>${escapeHtml(attendee.name || attendee.nickname || '微信嘉宾')}</strong>
+            </div>`).join('') : '<span class="checkin-waiting">等待嘉宾入场</span>'}
+          </div>
+        </section>
+        ${renderScreenToolbar('checkin')}
+      </div>
+    </main>`;
+  paintAvatarStage();
+  bindScreenEvents();
+  bindDrag();
+  bindQrResize();
+  window.lucide?.createIcons();
+}
+
+function renderScreen() {
+  disposeDrawScene();
+  const config = state.config || {};
+  const selectedPrize = getSelectedScreenPrize();
+  const selectedWinners = selectedPrize ? state.winners.filter((winner) => winner.prizeId === selectedPrize.id) : [];
+  const selectedQuantity = Math.max(0, Number(selectedPrize?.quantity || 0));
+  const selectedRemaining = Math.max(0, selectedQuantity - selectedWinners.length);
+  const selectedDrawCount = Math.max(1, Math.min(Number(selectedPrize?.drawCount || 1), selectedRemaining || 1));
+  const prizeOptions = state.prizes.map((prize) => `<option value="${escapeHtml(prize.id)}" ${prize.id === selectedPrize?.id ? 'selected' : ''}>${escapeHtml(prize.name)}</option>`).join('');
+  app.innerHTML = `
+    <main class="screen-page lottery-display-page">
+      <div class="screen-tech-lines" aria-hidden="true"><i></i><i></i><i></i></div>
+      ${renderScreenBrand()}
+      ${config.musicUrl ? `<audio id="screenAudio" src="${escapeHtml(config.musicUrl)}" loop></audio>` : ''}
       <button id="drawStopButton" class="draw-stop-button" type="button">
-        <span aria-hidden="true">■</span>
+        ${screenIcon('square')}
         <strong>停止抽奖</strong>
       </button>
+      <div id="drawLiveStatus" class="draw-live-status" role="status" aria-live="polite"></div>
       <div class="screen-content">
         <header class="screen-title">
           <h1>${escapeHtml(config.eventTitle || '微信签到抽奖活动')}</h1>
@@ -311,7 +591,7 @@ function renderScreen() {
             </div>
             <div class="active-prize-name">${escapeHtml(selectedPrize?.name || '请创建奖项')}</div>
             <div class="gift-stage">
-              <button id="previousPrizeButton" class="gift-arrow" type="button" aria-label="上一个奖项" title="上一个奖项" ${state.prizes.length > 1 ? '' : 'disabled'}>‹</button>
+              <button id="previousPrizeButton" class="gift-arrow" type="button" aria-label="上一个奖项" title="上一个奖项" ${state.prizes.length > 1 ? '' : 'disabled'}>${screenIcon('chevron-left')}</button>
               <div class="gift-visual" aria-hidden="true">
                 <div class="gift-rays"></div>
                 <div class="gift-particles"></div>
@@ -325,7 +605,7 @@ function renderScreen() {
                   </div>
                 `}
               </div>
-              <button id="nextPrizeButton" class="gift-arrow" type="button" aria-label="下一个奖项" title="下一个奖项" ${state.prizes.length > 1 ? '' : 'disabled'}>›</button>
+              <button id="nextPrizeButton" class="gift-arrow" type="button" aria-label="下一个奖项" title="下一个奖项" ${state.prizes.length > 1 ? '' : 'disabled'}>${screenIcon('chevron-right')}</button>
             </div>
             <div class="prize-summary">
               <strong>${escapeHtml(selectedPrize?.name || '暂无奖项')}</strong>
@@ -335,39 +615,33 @@ function renderScreen() {
             <div class="draw-actions">
               <select id="screenPrize" class="screen-prize-select" aria-label="当前奖项">${prizeOptions}</select>
               <div class="draw-count-control">
-                <button type="button" data-draw-count-delta="-1" aria-label="减少抽取人数" title="减少抽取人数">−</button>
+                <button type="button" data-draw-count-delta="-1" aria-label="减少抽取人数" title="减少抽取人数">${screenIcon('minus')}</button>
                 <input id="screenCount" type="number" min="1" max="${Math.max(1, selectedRemaining)}" value="${selectedDrawCount}" aria-label="本次抽取人数" readonly />
-                <button type="button" data-draw-count-delta="1" aria-label="增加抽取人数" title="增加抽取人数">＋</button>
+                <button type="button" data-draw-count-delta="1" aria-label="增加抽取人数" title="增加抽取人数">${screenIcon('plus')}</button>
               </div>
-              <button id="drawButton" ${state.attendees.length && selectedPrize ? '' : 'disabled'}>开始抽奖</button>
+              <button id="drawButton" ${availableCandidates().length && selectedPrize && selectedRemaining ? '' : 'disabled'}>${screenIcon('play')}${selectedPrize && !selectedRemaining ? '本奖项已抽完' : '开始抽奖'}</button>
             </div>
           </section>
           <section class="winner-panel">
             <div class="panel-ribbon panel-ribbon-wide">
-              <h2>获奖名单</h2>
-              <span>已抽中 ${state.winners.length} 位</span>
+              <h2>抽奖结果</h2>
+              <span>${escapeHtml(selectedPrize?.name || '暂无奖项')} · ${selectedWinners.length} 位</span>
             </div>
             <div class="winner-stage">
-              <div id="avatarStage" class="avatar-stage ${escapeHtml(config.wallMode || 'sphere')}"></div>
+              <div id="avatarStage" class="avatar-stage" aria-hidden="true"></div>
               <div id="drawFocusRail" class="draw-focus-rail" aria-hidden="true"></div>
-              <div class="prize-status-board">${renderPrizeStatusBoard()}</div>
-              <button id="openWinnerBookButton" class="winner-book-trigger" type="button">查看名单</button>
+              <div id="prizeResults" class="prize-results" aria-label="${escapeHtml(selectedPrize?.name || '')}抽奖结果">${renderPrizeResults(selectedPrize)}</div>
+              <button id="openWinnerBookButton" class="winner-book-trigger" type="button">${screenIcon('list')}查看本奖项名单</button>
             </div>
           </section>
         </section>
-        <footer class="screen-toolbar">
-          <button class="ghost" id="fullscreenButton">全屏</button>
-          <button class="ghost" id="musicButton" ${config.musicUrl ? '' : 'disabled'}>音乐</button>
-          <button class="ghost" id="shapeButton">切换头像墙</button>
-          <button class="ghost" id="backAdminButton">后台</button>
-        </footer>
+        ${renderScreenToolbar('lottery')}
       </div>
     </main>
   `;
-  paintAvatarStage();
   bindScreenEvents();
   bindDrag();
-  bindQrResize();
+  window.lucide?.createIcons();
 }
 
 function getSelectedScreenPrize() {
@@ -398,44 +672,41 @@ function clampScreenPosition(value, fallback, elementSize, axis) {
   return Math.max(0, Math.min(number, max));
 }
 
-function renderPrizeStatusBoard() {
-  if (!state.prizes.length) return '<div class="prize-status-empty">暂无奖项</div>';
-  return state.prizes.map((prize) => {
-    const winners = state.winners.filter((winner) => winner.prizeId === prize.id);
-    const quantity = Math.max(0, Number(prize.quantity || 0));
-    const remaining = Math.max(0, quantity - winners.length);
-    const percent = quantity ? Math.min(100, Math.round((winners.length / quantity) * 100)) : 0;
-    const names = winners.slice().reverse().slice(0, 4).map((winner) => winner.name || winner.nickname || '幸运嘉宾');
-    return `
-      <div class="prize-status-card">
-        <div class="prize-status-head">
-          <strong>${escapeHtml(prize.name)}</strong>
-          <span>${winners.length}/${quantity || '-'}</span>
-        </div>
-        <div class="prize-status-bar" style="--progress:${percent}%"><i></i></div>
-        <div class="prize-status-meta">剩余 ${remaining} 位</div>
-        <div class="prize-status-names">${names.length ? names.map((name) => `<span>${escapeHtml(name)}</span>`).join('') : '<em>暂无中奖</em>'}</div>
-      </div>
-    `;
-  }).join('');
+function winnersForPrize(prizeId) {
+  return state.winners.filter((winner) => winner.prizeId === prizeId);
 }
 
-function paintAvatarStage() {
+function renderPrizeResults(prize) {
+  const winners = prize ? winnersForPrize(prize.id) : [];
+  if (!winners.length) {
+    return `<div class="prize-results-empty">${screenIcon('trophy')}<strong>${prize ? `${escapeHtml(prize.name)} · 等待幸运揭晓` : '暂无奖项'}</strong><span>暂无中奖记录</span></div>`;
+  }
+  return `<div class="prize-results-grid">${winners.slice().reverse().map((winner, index) => `
+    <article class="prize-result" data-winner-id="${escapeHtml(winner.id)}">
+      <span class="prize-result-number">${String(winners.length - index).padStart(2, '0')}</span>
+      <img src="${escapeHtml(winner.avatar || makeAvatarDataUrl(winner.name))}" alt="" />
+      <strong>${escapeHtml(winner.name || winner.nickname || '幸运嘉宾')}</strong>
+      <span>${escapeHtml(winner.company || winner.nickname || '')}</span>
+    </article>`).join('')}</div>`;
+}
+
+function paintAvatarStage(attendeePool = state.attendees) {
   const stage = document.querySelector('#avatarStage');
   if (!stage) return;
   const wallMode = state.config.wallMode || 'sphere';
-  const visualMode = getVisualWallMode(wallMode, state.attendees.length);
+  const visualMode = getVisualWallMode(wallMode, attendeePool.length);
   stage.classList.remove('sphere', 'wall', 'text', 'orbit');
   stage.classList.add(visualMode);
-  const maxVisible = ['sphere', 'orbit'].includes(visualMode) ? 520 : 180;
-  const attendees = state.attendees.slice(-maxVisible);
+  const width = Math.max(stage.clientWidth, 320);
+  const height = Math.max(stage.clientHeight, 320);
+  const wallCapacity = Math.max(24, Math.floor(width / 60) * Math.floor(height / 22));
+  const maxVisible = ['sphere', 'orbit'].includes(visualMode) ? 520 : Math.min(180, wallCapacity);
+  const attendees = attendeePool.slice(-maxVisible);
   stage.classList.toggle('is-dense', attendees.length >= 36);
   if (!attendees.length) {
     stage.innerHTML = '<div class="empty-stage">等待扫码签到</div>';
     return;
   }
-  const width = Math.max(stage.clientWidth, 320);
-  const height = Math.max(stage.clientHeight, 320);
   const avatarSize = getResponsiveAvatarSize(attendees.length, width, height, visualMode);
   stage.style.setProperty('--avatar-size', `${avatarSize}px`);
   stage.style.setProperty('--avatar-node-width', `${Math.max(avatarSize + 12, 56)}px`);
@@ -513,11 +784,11 @@ function getResponsiveAvatarSize(count, width, height, mode) {
     return Math.max(14, Math.min(28, Math.round(tile)));
   }
   if (mode !== 'wall') return 64;
-  const cols = Math.max(1, Math.ceil(Math.sqrt(count * 1.35)));
+  const cols = Math.max(1, Math.min(Math.ceil(Math.sqrt(count * 1.35)), Math.floor(width / 60)));
   const rows = Math.max(1, Math.ceil(count / cols));
   const byWidth = Math.floor((width / (cols + 0.5)) * 0.82);
-  const byHeight = Math.floor((height / (rows + 0.5)) * 0.55);
-  return Math.max(42, Math.min(64, byWidth, byHeight));
+  const byHeight = Math.floor((Math.max(1, height - 104) / rows) * 0.8);
+  return Math.max(14, Math.min(64, byWidth, byHeight));
 }
 
 function getStageAvoidRect(stage, width, height) {
@@ -733,6 +1004,13 @@ function textPositions(count, width, height, text) {
 }
 
 function bindScreenEvents() {
+  document.querySelectorAll('[data-screen-path]').forEach((link) => {
+    link.addEventListener('click', (event) => {
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      if (!drawState.rolling) navigate(link.dataset.screenPath);
+    });
+  });
   document.querySelector('#fullscreenButton')?.addEventListener('click', () => {
     if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
     else document.exitFullscreen?.();
@@ -995,6 +1273,7 @@ function bindQrResize() {
 }
 
 function startDraw() {
+  if (drawState.rolling || drawState.stopping) return;
   const prizeId = document.querySelector('#screenPrize')?.value;
   if (!prizeId) {
     toast('请先在后台创建奖项');
@@ -1013,11 +1292,15 @@ function startDraw() {
     return;
   }
   drawState.rolling = true;
+  drawState.runId += 1;
+  drawState.prizeId = prizeId;
+  drawState.count = Math.max(1, Math.min(Number(document.querySelector('#screenCount')?.value) || 1, remainingCount));
   drawState.railTick = 0;
   drawState.activeAnimation = ['orbit', 'sphere', 'wall', 'text'].includes(prize.animation) ? prize.animation : 'sphere';
-  document.querySelector('#drawButton').textContent = '停止';
-  updateDrawStatus('抽奖中');
   setDrawEffects(true, drawState.activeAnimation);
+  paintAvatarStage(drawState.candidates);
+  startDrawScene(drawState.activeAnimation);
+  updateDrawStatus(`${prize.name} · 正在抽取 ${drawState.count} 位幸运嘉宾`);
   const initialAttendee = drawState.candidates[Math.floor(Math.random() * drawState.candidates.length)];
   highlightRollingCandidate(initialAttendee);
   updateDrawFocusRail(initialAttendee);
@@ -1031,22 +1314,36 @@ function startDraw() {
 }
 
 async function stopDraw() {
+  if (!drawState.rolling || drawState.stopping) return;
+  drawState.stopping = true;
   window.clearInterval(drawState.timer);
   window.clearInterval(drawState.fxTimer);
-  drawState.rolling = false;
-  setDrawEffects(false);
-  document.querySelector('#drawButton').textContent = '开始抽奖';
-  updateDrawStatus('等待开始');
+  const stopButton = document.querySelector('#drawStopButton');
+  stopButton.disabled = true;
+  stopButton.querySelector('strong').textContent = '正在揭晓';
+  document.querySelector('.screen-page')?.classList.add('is-revealing');
+  drawState.scene?.pause();
+  updateDrawStatus('正在揭晓中奖嘉宾');
   try {
     const result = await api('/api/draw', {
       method: 'POST',
       body: {
-        prizeId: document.querySelector('#screenPrize')?.value,
-        count: document.querySelector('#screenCount')?.value
+        prizeId: drawState.prizeId,
+        count: drawState.count
       }
     });
+    // Socket updates may arrive before or after the HTTP response.
+    const winnerIds = new Set(state.winners.map((winner) => winner.id));
+    state.winners.push(...result.winners.filter((winner) => !winnerIds.has(winner.id)));
+    screenUiState.selectedPrizeId = result.prize.id;
+    drawState.rolling = false;
+    drawState.stopping = false;
+    renderScreen();
     showWinnerModal(result.prize, result.winners);
   } catch (err) {
+    drawState.rolling = false;
+    drawState.stopping = false;
+    renderScreen();
     toast(err.message);
   }
 }
@@ -1057,12 +1354,38 @@ function availableCandidates() {
   return state.attendees.filter((attendee) => !winnerIds.has(attendee.id));
 }
 
-function updateDrawStatus(text) {
-  const card = document.querySelector('.rolling-card');
-  if (card && !card.querySelector('#drawStatus')) {
-    card.innerHTML = '<div id="drawStatus" class="draw-status"></div>';
+async function startDrawScene(animation) {
+  if (!['sphere', 'orbit'].includes(animation)) return;
+  const runId = drawState.runId;
+  try {
+    const { createLotteryScene } = await import('/lottery-scene.js');
+    if (!drawState.rolling || drawState.stopping || runId !== drawState.runId) return;
+    const host = document.querySelector('.winner-stage');
+    if (!host) return;
+    const attendees = drawState.candidates.slice(-180).map((attendee) => ({
+      src: attendee.avatar || makeAvatarDataUrl(attendee.name),
+      fallback: makeAvatarDataUrl(attendee.name)
+    }));
+    const scene = createLotteryScene(host, attendees, animation);
+    drawState.scene = scene;
+    await scene.ready;
+    if (drawState.rolling && !drawState.stopping && runId === drawState.runId) {
+      document.querySelector('.screen-page')?.classList.add('has-webgl');
+    }
+  } catch {
+    // Keep the CSS avatar animation on devices without WebGL.
+    if (runId === drawState.runId) disposeDrawScene();
   }
-  const status = document.querySelector('#drawStatus');
+}
+
+function disposeDrawScene() {
+  drawState.scene?.dispose();
+  drawState.scene = null;
+  drawState.runId += 1;
+}
+
+function updateDrawStatus(text) {
+  const status = document.querySelector('#drawLiveStatus');
   if (status) status.textContent = text;
 }
 
@@ -1095,8 +1418,8 @@ function refreshDrawGeometry(animation) {
   const stage = document.querySelector('#avatarStage');
   if (!stage) return;
   const nodes = Array.from(stage.querySelectorAll('.avatar-node'));
-  const width = Math.max(stage.clientWidth, 640);
-  const height = Math.max(stage.clientHeight, 420);
+  const width = Math.max(stage.clientWidth, 280);
+  const height = Math.max(stage.clientHeight, 320);
   const mode = ['orbit', 'sphere', 'wall', 'text'].includes(animation) ? animation : 'sphere';
   stage.classList.remove('draw-mode-sphere', 'draw-mode-orbit', 'draw-mode-wall', 'draw-mode-text');
   stage.classList.add(`draw-mode-${mode}`);
@@ -1142,7 +1465,7 @@ function getDrawSpherePosition(index, count, width, height, mode) {
   return {
     angle: Math.round(angle * 100) / 100,
     y: Math.round(yUnit * height * (mode === 'orbit' ? 0.26 : 0.41)),
-    radius: Math.round(Math.max(150, baseRadius * ringRadius)),
+    radius: Math.round(Math.max(35, baseRadius * ringRadius)),
     scale: (0.72 + ringRadius * 0.34).toFixed(2),
     delay: Number((index * -0.08).toFixed(2))
   };
@@ -1201,13 +1524,13 @@ function showWinnerModal(prize, winners) {
   mask.innerHTML = `
     <section class="modal winner-modal" role="dialog" aria-modal="true" aria-labelledby="winnerModalTitle">
       <div class="winner-modal-rays"></div>
-      <button class="winner-modal-close" type="button" data-close-modal aria-label="关闭中奖名单" title="关闭">×</button>
+      <button class="winner-modal-close" type="button" data-close-modal aria-label="关闭中奖名单" title="关闭">${screenIcon('x')}</button>
       <header class="winner-modal-header">
         <span>LUCKY MOMENT</span>
         <h2 id="winnerModalTitle">获奖名单</h2>
         <p>${escapeHtml(prize.name)}</p>
       </header>
-      <div class="winner-grid">
+      <div class="winner-grid ${winners.length === 1 ? 'is-single' : ''}">
         ${winners.map((winner, index) => `
           <div class="winner-card" style="--winner-delay:${index * 0.08}s">
             <div class="winner-rank">${String(index + 1).padStart(2, '0')}</div>
@@ -1220,30 +1543,26 @@ function showWinnerModal(prize, winners) {
           </div>
         `).join('')}
       </div>
+      <div class="winner-modal-actions"><button type="button" data-close-modal>返回抽奖结果</button></div>
     </section>
   `;
   document.body.appendChild(mask);
-  mask.querySelector('[data-close-modal]').addEventListener('click', () => mask.remove());
+  mask.querySelectorAll('[data-close-modal]').forEach((button) => button.addEventListener('click', () => mask.remove()));
+  window.lucide?.createIcons();
 }
 
 function showWinnerBookModal() {
   const mask = document.createElement('div');
   mask.className = 'modal-mask';
-  const prizeGroups = state.prizes.map((prize) => ({
-    prize,
-    winners: state.winners.filter((winner) => winner.prizeId === prize.id)
-  })).filter((group) => group.winners.length);
-  const knownPrizeIds = new Set(state.prizes.map((prize) => prize.id));
-  const otherWinners = state.winners.filter((winner) => !knownPrizeIds.has(winner.prizeId));
-  if (otherWinners.length) {
-    prizeGroups.push({ prize: { name: '其他奖项' }, winners: otherWinners });
-  }
-  const total = state.winners.length;
+  const prize = getSelectedScreenPrize();
+  const winners = prize ? winnersForPrize(prize.id) : [];
+  const prizeGroups = prize ? [{ prize, winners }] : [];
+  const total = winners.length;
   mask.innerHTML = `
     <section class="modal winner-book-modal">
       <header class="winner-book-header">
         <span>WINNER LIST</span>
-        <h2>完整中奖名单</h2>
+        <h2>${escapeHtml(prize?.name || '当前奖项')}中奖名单</h2>
         <p>已抽中 ${total} 位</p>
       </header>
       <div class="winner-book-content">
@@ -1278,7 +1597,8 @@ function showWinnerBookModal() {
 }
 
 function showFlyCard(attendee) {
-  if (window.location.pathname !== '/screen') return;
+  if (window.location.pathname !== '/screen/checkin' || !hasRole('screen')) return;
+  document.querySelector('.fly-card')?.remove();
   const card = document.createElement('div');
   card.className = 'fly-card';
   card.innerHTML = `
@@ -1305,7 +1625,8 @@ function renderAdmin() {
           ${adminTabButton('prizes', '抽奖设置')}
           ${adminTabButton('settings', '页面设置')}
           ${adminTabButton('exports', '数据导出')}
-          <a class="button-link" href="/screen">打开大屏</a>
+          <a class="button-link" href="/screen/checkin">签到展示</a>
+          <a class="button-link" href="/screen/lottery">抽奖大屏</a>
         </nav>
       </aside>
       <section class="admin-main">
@@ -1464,6 +1785,12 @@ function renderSettingsPanel() {
           <label>活动标题<input name="eventTitle" value="${escapeHtml(config.eventTitle || '')}" /></label>
           <label>副标题<input name="subtitle" value="${escapeHtml(config.subtitle || '')}" /></label>
         </div>
+        <label>签到方式
+          <select name="checkinMode" aria-label="签到方式">
+            ${modeOption('local', '内网填写姓名与头像', config.checkinMode || 'local')}
+            ${modeOption('wechat', '微信网页授权', config.checkinMode)}
+          </select>
+        </label>
         <div class="grid-3">
           <label>头像墙模式
             <select name="wallMode">
@@ -1651,6 +1978,7 @@ async function saveSettings(event) {
   const body = {
     eventTitle: form.get('eventTitle'),
     subtitle: form.get('subtitle'),
+    checkinMode: form.get('checkinMode'),
     wallMode: form.get('wallMode'),
     wallText: form.get('wallText'),
     theme: form.get('theme'),

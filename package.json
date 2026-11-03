@@ -10,9 +10,11 @@
   },
   "dependencies": {
     "express": "^5.2.1",
+    "lucide": "^1.66.0",
     "multer": "^2.1.1",
     "qrcode": "^1.5.4",
     "socket.io": "^4.8.3",
+    "three": "^0.187.0",
     "write-excel-file": "^4.0.6"
   }
 }

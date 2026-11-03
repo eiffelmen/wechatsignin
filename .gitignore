@@ -5,3 +5,5 @@ assets/uploads/*
 data/store.json
 *.log
 .DS_Store
+.playwright-cli/
+output/playwright/
